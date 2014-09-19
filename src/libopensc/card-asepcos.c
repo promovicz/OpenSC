@@ -847,11 +847,15 @@ static int asepcos_card_ctl(sc_card_t *card, unsigned long cmd, void *ptr)
  */
 static int asepcos_build_pin_apdu(sc_card_t *card, sc_apdu_t *apdu,
 	struct sc_pin_cmd_data *data, u8 *buf, size_t buf_len,
-	unsigned int cmd, int is_puk)
+	unsigned int cmd, int is_puk, int use_pinpad)
 {
 	int r, fileid;
 	u8  *p = buf;
 	sc_cardctl_asepcos_akn2fileid_t st;
+
+	sc_debug(card->ctx, SC_LOG_DEBUG_NORMAL,
+			 "pin maxlen %d minlen %d padchar %d\n",
+			 data->pin1.max_length, data->pin1.min_length, data->pin1.pad_char);
 
 	switch (cmd) {
 	case SC_PIN_CMD_VERIFY:
@@ -868,8 +872,14 @@ static int asepcos_build_pin_apdu(sc_card_t *card, sc_apdu_t *apdu,
 		*p++ = (fileid >> 16) & 0xff;
 		*p++ = (fileid >> 8 ) & 0xff;
 		*p++ = fileid & 0xff;
-        memcpy(p, data->pin1.data, data->pin1.len);
-        p += data->pin1.len;
+        if(use_pinpad) {
+            // XXX probably not the right thing to do
+            memset(p, data->pin1.pad_char, data->pin1.max_length);
+            p += data->pin1.max_length;
+        } else {
+            memcpy(p, data->pin1.data, data->pin1.len);
+            p += data->pin1.len;
+        }
 		apdu->lc       = p - buf;
 		apdu->datalen  = p - buf;
 		apdu->data     = buf;
@@ -922,7 +932,7 @@ static int asepcos_pin_cmd(sc_card_t *card, struct sc_pin_cmd_data *pdata,
 	int *tries_left)
 {
 	sc_apdu_t apdu;
-	int r = SC_SUCCESS;
+	int r = SC_SUCCESS, use_pinpad = 0;
 	u8  sbuf[SC_MAX_APDU_BUFFER_SIZE];
 
 	if (tries_left)
@@ -930,10 +940,16 @@ static int asepcos_pin_cmd(sc_card_t *card, struct sc_pin_cmd_data *pdata,
 
 	/* only PIN verification is supported at the moment  */
 
-	/* check PIN length */
-	if (pdata->pin1.len < 4 || pdata->pin1.len > 16) {
-		sc_debug(card->ctx, SC_LOG_DEBUG_NORMAL, "invalid PIN1 length");
-		return SC_ERROR_INVALID_PIN_LENGTH; 
+	if(pdata->flags & SC_PIN_CMD_USE_PINPAD) {
+		/* using the pinpad */
+		sc_debug(card->ctx, SC_LOG_DEBUG_NORMAL, "using pinpad");
+		use_pinpad = 1;
+	} else {
+		/* using provided pin */
+		if (pdata->pin1.len < 4 || pdata->pin1.len > 16) {
+			sc_debug(card->ctx, SC_LOG_DEBUG_NORMAL, "invalid PIN1 length");
+			return SC_ERROR_INVALID_PIN_LENGTH; 
+		}
 	}
 
 	switch (pdata->cmd) {
@@ -944,12 +960,24 @@ static int asepcos_pin_cmd(sc_card_t *card, struct sc_pin_cmd_data *pdata,
 		if (pdata->pin_type == SC_AC_AUT && pdata->pin_reference)
 			return SC_ERROR_INVALID_ARGUMENTS;
 		/* build verify APDU and send it to the card */
-		r = asepcos_build_pin_apdu(card, &apdu, pdata, sbuf, sizeof(sbuf), SC_PIN_CMD_VERIFY, 0);
+		r = asepcos_build_pin_apdu(card, &apdu, pdata, sbuf, sizeof(sbuf), SC_PIN_CMD_VERIFY, 0, use_pinpad);
 		if (r != SC_SUCCESS)
 			break;
-		r = sc_transmit_apdu(card, &apdu);
-		if (r != SC_SUCCESS)
-			sc_debug(card->ctx, SC_LOG_DEBUG_NORMAL, "APDU transmit failed");
+		if (use_pinpad) {
+			if (card->reader && card->reader->ops
+				&& card->reader->ops->perform_verify) {
+				pdata->apdu = &apdu;
+				r = card->reader->ops->perform_verify(card->reader, pdata);
+				if (r != SC_SUCCESS)
+					sc_debug(card->ctx, SC_LOG_DEBUG_NORMAL, "pinpad verify failed: %s", sc_strerror(r));
+			} else {
+				r = SC_ERROR_NOT_SUPPORTED;
+			}
+		} else {
+			r = sc_transmit_apdu(card, &apdu);
+			if (r != SC_SUCCESS)
+				sc_debug(card->ctx, SC_LOG_DEBUG_NORMAL, "APDU transmit failed");
+		}
 		break;
 	case SC_PIN_CMD_CHANGE:
 		if (pdata->pin_type != SC_AC_CHV)
@@ -959,7 +987,7 @@ static int asepcos_pin_cmd(sc_card_t *card, struct sc_pin_cmd_data *pdata,
 			return SC_ERROR_INVALID_PIN_LENGTH; 
 		}
 		/* 1. step: verify the old pin */
-		r = asepcos_build_pin_apdu(card, &apdu, pdata, sbuf, sizeof(sbuf), SC_PIN_CMD_VERIFY, 0);
+		r = asepcos_build_pin_apdu(card, &apdu, pdata, sbuf, sizeof(sbuf), SC_PIN_CMD_VERIFY, 0, use_pinpad);
 		if (r != SC_SUCCESS)
 			break;
 		r = sc_transmit_apdu(card, &apdu);
@@ -973,7 +1001,7 @@ static int asepcos_pin_cmd(sc_card_t *card, struct sc_pin_cmd_data *pdata,
 			break;
 		}
 		/* 2, step: use CHANGE KEY to update the PIN */
-		r = asepcos_build_pin_apdu(card, &apdu, pdata, sbuf, sizeof(sbuf), SC_PIN_CMD_CHANGE, 0);
+		r = asepcos_build_pin_apdu(card, &apdu, pdata, sbuf, sizeof(sbuf), SC_PIN_CMD_CHANGE, 0, use_pinpad);
 		if (r != SC_SUCCESS)
 			break;
 		r = sc_transmit_apdu(card, &apdu);
@@ -989,7 +1017,7 @@ static int asepcos_pin_cmd(sc_card_t *card, struct sc_pin_cmd_data *pdata,
 			return SC_ERROR_INVALID_PIN_LENGTH; 
 		}
 		/* 1. step: verify the puk */
-		r = asepcos_build_pin_apdu(card, &apdu, pdata, sbuf, sizeof(sbuf), SC_PIN_CMD_VERIFY, 1);
+		r = asepcos_build_pin_apdu(card, &apdu, pdata, sbuf, sizeof(sbuf), SC_PIN_CMD_VERIFY, 1, use_pinpad);
 		if (r != SC_SUCCESS)
 			break;
 		r = sc_transmit_apdu(card, &apdu);
@@ -998,7 +1026,7 @@ static int asepcos_pin_cmd(sc_card_t *card, struct sc_pin_cmd_data *pdata,
 			break;
 		}
 		/* 2, step: unblock and change the pin */
-		r = asepcos_build_pin_apdu(card, &apdu, pdata, sbuf, sizeof(sbuf), SC_PIN_CMD_UNBLOCK, 0);
+		r = asepcos_build_pin_apdu(card, &apdu, pdata, sbuf, sizeof(sbuf), SC_PIN_CMD_UNBLOCK, 0, use_pinpad);
 		if (r != SC_SUCCESS)
 			break;
 		r = sc_transmit_apdu(card, &apdu);
